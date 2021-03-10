@@ -53,6 +53,8 @@ struct hello_context_t {
 	char *buff;
 	char *bdev_name;
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
+	struct spdk_bdev_zone_info *zone_info;
+	uint64_t alba;
 };
 
 /*
@@ -79,6 +81,10 @@ static int hello_bdev_parse_arg(int ch, char *arg)
 	return 0;
 }
 
+bool time_to_stop = false;
+
+static void hello_append(void *arg);
+
 /*
  * Callback function for read io completion.
  */
@@ -95,10 +101,16 @@ read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	/* Complete the bdev io and close the channel */
 	spdk_bdev_free_io(bdev_io);
-	spdk_put_io_channel(hello_context->bdev_io_channel);
-	spdk_bdev_close(hello_context->bdev_desc);
-	SPDK_NOTICELOG("Stopping app\n");
-	spdk_app_stop(success ? 0 : -1);
+
+	if (time_to_stop) {
+		spdk_put_io_channel(hello_context->bdev_io_channel);
+		spdk_bdev_close(hello_context->bdev_desc);
+		SPDK_NOTICELOG("Stopping app\n");
+		spdk_app_stop(success ? 0 : -1);
+	} else {
+		time_to_stop = true;
+		hello_append(hello_context);
+	}
 }
 
 static void
@@ -106,11 +118,11 @@ hello_read(void *arg)
 {
 	struct hello_context_t *hello_context = arg;
 	int rc = 0;
-	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
 
-	SPDK_NOTICELOG("Reading io\n");
-	rc = spdk_bdev_read(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			    hello_context->buff, 0, length, read_complete, hello_context);
+	SPDK_NOTICELOG("Reading io at: %#lx\n", hello_context->alba);
+	rc = spdk_bdev_read_blocks(hello_context->bdev_desc, hello_context->bdev_io_channel,
+				   hello_context->buff, hello_context->alba, 1,
+				   read_complete, hello_context);
 
 	if (rc == -ENOMEM) {
 		SPDK_NOTICELOG("Queueing io\n");
@@ -128,22 +140,22 @@ hello_read(void *arg)
 	}
 }
 
-/*
- * Callback function for write io completion.
- */
 static void
-write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+append_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct hello_context_t *hello_context = cb_arg;
 	uint32_t length;
+
+	hello_context->alba = spdk_bdev_io_get_append_location(bdev_io);
 
 	/* Complete the I/O */
 	spdk_bdev_free_io(bdev_io);
 
 	if (success) {
-		SPDK_NOTICELOG("bdev io write completed successfully\n");
+		SPDK_NOTICELOG("bdev io append completed successfully\n");
+		printf("Appended to ALBA: %#lx\n", hello_context->alba);
 	} else {
-		SPDK_ERRLOG("bdev io write error: %d\n", EIO);
+		SPDK_ERRLOG("bdev io append error: %d\n", EIO);
 		spdk_put_io_channel(hello_context->bdev_io_channel);
 		spdk_bdev_close(hello_context->bdev_desc);
 		spdk_app_stop(-1);
@@ -158,26 +170,67 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 }
 
 static void
-hello_write(void *arg)
+hello_append(void *arg)
 {
 	struct hello_context_t *hello_context = arg;
 	int rc = 0;
-	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
 
-	SPDK_NOTICELOG("Writing to the bdev\n");
-	rc = spdk_bdev_write(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			     hello_context->buff, 0, length, write_complete, hello_context);
+	SPDK_NOTICELOG("Appending to the bdev\n");
+
+	snprintf(hello_context->buff, spdk_bdev_get_block_size(hello_context->bdev), "%s",
+		 "Hello World 2!\n");
+
+	rc = spdk_bdev_zone_append(hello_context->bdev_desc, hello_context->bdev_io_channel,
+				   hello_context->buff, 0, 1, append_complete, hello_context);
 
 	if (rc == -ENOMEM) {
 		SPDK_NOTICELOG("Queueing io\n");
 		/* In case we cannot perform I/O now, queue I/O */
 		hello_context->bdev_io_wait.bdev = hello_context->bdev;
-		hello_context->bdev_io_wait.cb_fn = hello_write;
+		hello_context->bdev_io_wait.cb_fn = hello_append;
 		hello_context->bdev_io_wait.cb_arg = hello_context;
 		spdk_bdev_queue_io_wait(hello_context->bdev, hello_context->bdev_io_channel,
 					&hello_context->bdev_io_wait);
 	} else if (rc) {
-		SPDK_ERRLOG("%s error while writing to bdev: %d\n", spdk_strerror(-rc), rc);
+		SPDK_ERRLOG("%s error while appending to bdev: %d\n", spdk_strerror(-rc), rc);
+		spdk_put_io_channel(hello_context->bdev_io_channel);
+		spdk_bdev_close(hello_context->bdev_desc);
+		spdk_app_stop(-1);
+	}
+}
+
+static struct iovec iovs[2];
+static char *hello = "Hello ";
+
+static void
+hello_appendv(void *arg)
+{
+	struct hello_context_t *hello_context = arg;
+	int rc = 0;
+	size_t len = strlen(hello);
+	uint32_t block_size = spdk_bdev_get_block_size(hello_context->bdev);
+
+	SPDK_NOTICELOG("Appending vector to the bdev\n");
+
+	iovs[0].iov_base = spdk_dma_zmalloc(block_size, 4096, NULL);
+	iovs[0].iov_len = len;
+	iovs[1].iov_base = spdk_dma_zmalloc(block_size, 4096, NULL);
+	iovs[1].iov_len = block_size - len;
+	snprintf(iovs[0].iov_base, block_size, "%s", hello);
+	snprintf(iovs[1].iov_base, block_size, "%s", "World 1!\n");
+	rc = spdk_bdev_zone_appendv(hello_context->bdev_desc, hello_context->bdev_io_channel,
+				    iovs, 2, 0, 1, append_complete, hello_context);
+
+	if (rc == -ENOMEM) {
+		SPDK_NOTICELOG("Queueing io\n");
+		/* In case we cannot perform I/O now, queue I/O */
+		hello_context->bdev_io_wait.bdev = hello_context->bdev;
+		hello_context->bdev_io_wait.cb_fn = hello_appendv;
+		hello_context->bdev_io_wait.cb_arg = hello_context;
+		spdk_bdev_queue_io_wait(hello_context->bdev, hello_context->bdev_io_channel,
+					&hello_context->bdev_io_wait);
+	} else if (rc) {
+		SPDK_ERRLOG("%s error while appending to bdev: %d\n", spdk_strerror(-rc), rc);
 		spdk_put_io_channel(hello_context->bdev_io_channel);
 		spdk_bdev_close(hello_context->bdev_desc);
 		spdk_app_stop(-1);
@@ -191,6 +244,7 @@ hello_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 	SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
 }
 
+#if 0
 static void
 reset_zone_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -229,6 +283,36 @@ hello_reset_zone(void *arg)
 					&hello_context->bdev_io_wait);
 	} else if (rc) {
 		SPDK_ERRLOG("%s error while resetting zone: %d\n", spdk_strerror(-rc), rc);
+		spdk_put_io_channel(hello_context->bdev_io_channel);
+		spdk_bdev_close(hello_context->bdev_desc);
+		spdk_app_stop(-1);
+	}
+}
+#endif
+
+static void
+get_zone_info_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct hello_context_t *hello_context = cb_arg;
+	struct spdk_bdev_zone_info *zone_info = hello_context->zone_info;
+	uint64_t num_zones = spdk_bdev_get_num_zones(hello_context->bdev);
+	uint64_t i;
+
+	printf("%s success %u\n", __func__, success);
+	if (success) {
+		for (i = 0; i < num_zones; i++) {
+			printf("zone_id: %#lx wp: %#lx cap: %#lx state: %u\n",
+			       zone_info[i].zone_id, zone_info[i].write_pointer,
+			       zone_info[i].capacity, zone_info[i].state);
+		}
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success) {
+		hello_appendv(hello_context);
+	} else {
+		SPDK_ERRLOG("bdev io get zone info error: %d\n", EIO);
 		spdk_put_io_channel(hello_context->bdev_io_channel);
 		spdk_bdev_close(hello_context->bdev_desc);
 		spdk_app_stop(-1);
@@ -292,15 +376,21 @@ hello_start(void *arg1)
 		spdk_app_stop(-1);
 		return;
 	}
-	snprintf(hello_context->buff, blk_size, "%s", "Hello World!\n");
 
 	if (spdk_bdev_is_zoned(hello_context->bdev)) {
-		hello_reset_zone(hello_context);
-		/* If bdev is zoned, the callback, reset_zone_complete, will call hello_write() */
+		uint64_t num_zones = spdk_bdev_get_num_zones(hello_context->bdev);
+		printf("bdev name: %s is zoned!\n", spdk_bdev_get_name(hello_context->bdev));
+		printf("supports append ? %d\n", spdk_bdev_io_type_supported(hello_context->bdev,
+				SPDK_BDEV_IO_TYPE_ZONE_APPEND));
+		printf("max zone append size ? %d\n", spdk_bdev_get_max_zone_append_size(hello_context->bdev));
+
+		hello_context->zone_info = calloc(1, sizeof(*hello_context->zone_info) * num_zones);
+		rc = spdk_bdev_get_zone_info(hello_context->bdev_desc, hello_context->bdev_io_channel,
+					     0, num_zones, hello_context->zone_info, get_zone_info_complete, hello_context);
+		printf("spdk_bdev_get_zone_info() returned: %d\n", rc);
+
 		return;
 	}
-
-	hello_write(hello_context);
 }
 
 int
